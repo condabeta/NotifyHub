@@ -210,6 +210,9 @@ class NotificationService:
             row.provider_message_id = provider_message_id
 
         await session.flush()
+        # Server-side onupdate=now() expires `updated_at` after flush;
+        # refresh so every column is fully loaded before Pydantic reads them.
+        await session.refresh(row)
         return NotificationRead.model_validate(row)
 
 
