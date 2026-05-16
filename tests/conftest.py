@@ -55,6 +55,9 @@ def settings() -> Settings:
     return s
 
 
+ALEMBIC_HEAD_REVISION = "0001"
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _schema(settings: Settings):
     """Create the schema once per session using a one-shot event loop.
@@ -62,6 +65,11 @@ def _schema(settings: Settings):
     Done synchronously (via ``asyncio.run``) so this fixture leaves no asyncpg
     connections bound to a long-lived loop — every test fixture below is then
     free to live entirely inside the test's own event loop.
+
+    After creating tables we also stamp Alembic's ``alembic_version`` row at
+    the current head, so that a later ``alembic upgrade head`` (the API
+    container's startup step) is a no-op instead of trying to re-create
+    already-existing tables.
     """
 
     async def _create() -> None:
@@ -69,6 +77,19 @@ def _schema(settings: Settings):
         try:
             async with engine.begin() as conn:
                 await conn.run_sync(Base.metadata.create_all)
+                await conn.execute(
+                    text(
+                        "CREATE TABLE IF NOT EXISTS alembic_version ("
+                        "version_num VARCHAR(32) NOT NULL "
+                        "CONSTRAINT alembic_version_pkc PRIMARY KEY)"
+                    )
+                )
+                await conn.execute(text("DELETE FROM alembic_version"))
+                await conn.execute(
+                    text(
+                        "INSERT INTO alembic_version (version_num) VALUES (:v)"
+                    ).bindparams(v=ALEMBIC_HEAD_REVISION)
+                )
         finally:
             await engine.dispose()
 
