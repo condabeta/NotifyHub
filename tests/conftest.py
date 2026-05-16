@@ -11,7 +11,7 @@ import pytest_asyncio
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import async_sessionmaker
+from sqlalchemy.ext.asyncio import create_async_engine
 
 import app.database as db_module
 from app.api.routes import router
@@ -55,38 +55,71 @@ def settings() -> Settings:
     return s
 
 
-@pytest_asyncio.fixture(scope="session")
+@pytest.fixture(scope="session", autouse=True)
+def _schema(settings: Settings):
+    """Create the schema once per session using a one-shot event loop.
+
+    Done synchronously (via ``asyncio.run``) so this fixture leaves no asyncpg
+    connections bound to a long-lived loop — every test fixture below is then
+    free to live entirely inside the test's own event loop.
+    """
+
+    async def _create() -> None:
+        engine = create_async_engine(settings.postgres_dsn)
+        try:
+            async with engine.begin() as conn:
+                await conn.run_sync(Base.metadata.create_all)
+        finally:
+            await engine.dispose()
+
+    asyncio.run(_create())
+    yield
+
+
+@pytest_asyncio.fixture(autouse=True)
 async def _engine(settings: Settings):
+    """Per-test engine bound to the test's own event loop.
+
+    Initialising and disposing inside each test avoids the classic
+    'pool connection bound to a different event loop' asyncpg error that
+    bites when the engine is session-scoped but tests are function-scoped.
+    """
     db_module.init_engine(settings)
     engine = db_module._engine
     assert engine is not None
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)
-        await conn.run_sync(Base.metadata.create_all)
-    yield engine
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)
-    await db_module.dispose_engine()
+    try:
+        yield engine
+    finally:
+        async with engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "TRUNCATE notifications, notification_batches "
+                    "RESTART IDENTITY CASCADE"
+                )
+            )
+        await db_module.dispose_engine()
 
 
 @pytest_asyncio.fixture
 async def db_session(_engine) -> AsyncIterator:
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
     factory = async_sessionmaker(_engine, expire_on_commit=False)
     async with factory() as session:
         yield session
-    async with _engine.begin() as conn:
-        await conn.execute(
-            text("TRUNCATE notifications, notification_batches RESTART IDENTITY CASCADE")
-        )
 
 
 @pytest_asyncio.fixture
 async def idempotency_store(settings: Settings) -> AsyncIterator[IdempotencyStore]:
     store = IdempotencyStore.from_settings(settings)
-    # Flush only keys we control so we don't blow away other tenants in shared Redis.
-    yield store
-    await store.client.flushdb()
-    await store.close()
+    try:
+        # Wipe any leftover keys from previous runs so tests start clean.
+        await store.client.flushdb()
+        yield store
+    finally:
+        with contextlib.suppress(Exception):
+            await store.client.flushdb()
+        await store.close()
 
 
 @pytest_asyncio.fixture
@@ -94,8 +127,10 @@ async def broker(settings: Settings) -> AsyncIterator[Broker]:
     b = Broker(settings)
     await b.connect()
     await b.queue.purge()
-    yield b
-    await b.close()
+    try:
+        yield b
+    finally:
+        await b.close()
 
 
 class ProgrammableProvider(Provider):
@@ -127,7 +162,9 @@ class ProgrammableProvider(Provider):
 
 
 @pytest.fixture
-def programmable_providers() -> tuple[ProviderRegistry, ProgrammableProvider, ProgrammableProvider]:
+def programmable_providers() -> tuple[
+    ProviderRegistry, ProgrammableProvider, ProgrammableProvider
+]:
     sms = ProgrammableProvider("test-sms")
     email = ProgrammableProvider("test-email")
     registry = ProviderRegistry({Channel.SMS: sms, Channel.EMAIL: email})
